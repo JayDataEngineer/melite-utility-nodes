@@ -1,0 +1,2 @@
+# Exported pipeline workflows are generated artifacts — never commit them.
+*.json
