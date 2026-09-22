@@ -771,6 +771,281 @@ class MotionPreview:
 
 
 # ════════════════════════════════════════════════════════════════════════
+# The film tail's two nodes (2026-09-22, the §20 in-graph amendment:
+# the operator's provenance law — every artifact traces to a
+# composition of cards; the film is assembled IN-GRAPH, never by
+# harness ffmpeg)
+#
+# The §20 evidence was a 43h engine's OOM: the retired in-graph tail
+# consumed every window's tensors as graph data, so the scheduler
+# kept the whole film's backlog alive while later windows sampled.
+# The file tail inverts that: each window SAVES its own file (its
+# tensors die at its SaveVideo — no consumer after), and the
+# assembly decodes the FILES back in, strictly after every save
+# completed.
+#
+#   MeliteUnload       — the boundary: ordering wire + memory policy.
+#   MeliteConcatVideos — the loader: output-dir prefixes → IMAGE+AUDIO+fps.
+# ════════════════════════════════════════════════════════════════════════
+
+try:
+    import glob as _glob
+except ImportError:  # pragma: no cover — stdlib, always present
+    _glob = None
+
+try:
+    import numpy as _np
+    import torch as _torch
+except ImportError:  # standalone tooling/tests never decode media
+    _np = None
+    _torch = None
+
+try:
+    import av as _av
+except ImportError:  # standalone tooling/tests never decode media
+    _av = None
+
+import re as _re
+
+
+class MeliteUnload:
+    """The film tail's memory boundary — ordering wire + memory policy.
+
+    TWO jobs, one wire:
+
+    1. ORDERING (the structural half): consumes a VIDEO passthrough
+       (e.g. the last window's SaveVideo output) and returns a token
+       that downstream file-loaders wire as their ``after`` input.
+       ComfyUI's dependency order then guarantees every loader runs
+       only AFTER the saves completed — without this, a loader could
+       glob the output directory before the save writes and silently
+       stitch the PREVIOUS run's files (a wrong film that looks
+       fine — the worst failure this pack guards against). Being the
+       passthrough's last consumer also makes that tensor die here.
+
+    2. MEMORY POLICY (the operator's reload law, 2026-09-22): the
+       DEFAULT releases only the CUDA allocator's cached blocks
+       (comfy.model_management.soft_empty_cache) — model WEIGHTS
+       STAY resident, so the next film run pays no reload. Set
+       unload_models=True to also call unload_all_models() for a
+       full slate wipe (the kimodo/Hydra case: loaders that bypass
+       ComfyUI's own VRAM management and need an empty GPU).
+
+    The film tail's decode/encode is CPU-side (PyAV → torch CPU
+    tensors), so it never competes with resident weights — the
+    default costs nothing and saves minutes on the next run.
+    """
+
+    TITLE = "Melite Unload (film boundary)"
+    CATEGORY = "melite/film"
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("after",)
+    FUNCTION = "unload"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("VIDEO",),
+                "unload_models": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    def unload(self, video, unload_models=False):
+        import comfy.model_management as mm
+
+        if unload_models:
+            mm.unload_all_models()
+        mm.soft_empty_cache()
+        return ("melite-film-boundary",)
+
+
+def _resolve_output_prefix(prefix: str) -> str:
+    """One output-dir prefix → its newest ``<prefix>_<counter>_.mp4``.
+
+    SaveVideo writes ``<prefix>_<counter:05>_.mp4`` with a process-
+    monotonic counter, so newest-by-counter is THIS run's write (the
+    queue serializes runs per lane; a prefix never has two live
+    writers). Loud refusal when nothing matches — a missing window is
+    never silently skipped.
+    """
+    if _glob is None:
+        raise RuntimeError("melite-utility-nodes: glob unavailable")
+    import folder_paths
+
+    out_dir = folder_paths.get_output_directory()
+    pattern = os.path.join(out_dir, f"{prefix}_*.mp4")
+    matches = [
+        p for p in _glob.glob(pattern)
+        if _re.search(r"_(\d{5})_\.mp4$", p) is not None
+    ]
+    if not matches:
+        raise RuntimeError(
+            f"MeliteConcatVideos: no saved video matches prefix "
+            f"{prefix!r} under the output directory ({pattern}) — the "
+            f"window save must complete before this loader runs (wire "
+            f"MeliteUnload's token into 'after')"
+        )
+
+    def counter_of(path: str) -> int:
+        return int(_re.search(r"_(\d{5})_\.mp4$", path).group(1))
+
+    return max(matches, key=counter_of)
+
+
+def _decode_video_frames(path: str):
+    """One file → (frames [N,H,W,C] float 0..1 torch, fps float)."""
+    if _av is None or _torch is None:
+        raise RuntimeError(
+            "melite-utility-nodes: PyAV (av) is required to decode video files"
+        )
+    with _av.open(path) as container:
+        stream = container.streams.video[0]
+        fps = float(stream.average_rate)
+        frames = []
+        for frame in container.decode(streams=stream.index):
+            rgb = frame.reformat(format="rgb24").to_ndarray()
+            frames.append(_torch.from_numpy(rgb).float() / 255.0)
+        if not frames:
+            raise ValueError(f"No video frames decoded from {path}")
+        return _torch.stack(frames, dim=0), fps
+
+
+def _decode_audio_track(path: str, fallback_sec: float):
+    """One file → AUDIO dict {waveform [1,C,N], sample_rate} — the
+    engine's own convention (PyAV decode, never torchaudio: this venv
+    does not ship TorchCodec — the same law as melite-audio-nodes'
+    load_audio_file). Silent stereo when the file carries no audio
+    track (CreateVideo needs a legal AUDIO; silence is honest)."""
+    if _av is None or _torch is None:
+        raise RuntimeError(
+            "melite-utility-nodes: PyAV (av) is required to decode audio tracks"
+        )
+    with _av.open(path) as container:
+        if not container.streams.audio:
+            sr = 48000
+            n = max(1, int(round(fallback_sec * sr)))
+            return {"waveform": _torch.zeros(1, 2, n), "sample_rate": sr}
+        stream = container.streams.audio[0]
+        sr = int(stream.codec_context.sample_rate)
+        channels = stream.channels
+        frames = []
+        for frame in container.decode(streams=stream.index):
+            buf = _torch.from_numpy(frame.to_ndarray())
+            if buf.shape[0] != channels:
+                buf = buf.view(-1, channels).t()
+            frames.append(buf)
+        if not frames:
+            raise ValueError(f"No audio frames decoded from {path}")
+        wav = _torch.cat(frames, dim=1)
+        if wav.dtype == _torch.int16:
+            wav = wav.float() / (2 ** 15)
+        elif wav.dtype == _torch.int32:
+            wav = wav.float() / (2 ** 31)
+        return {"waveform": wav.unsqueeze(0), "sample_rate": sr}
+
+
+class MeliteConcatVideos:
+    """Load saved window FILES back into the graph — IMAGE + AUDIO + fps.
+
+    The film-assemble half of the §20 amendment: windows save to disk
+    (their tensors die at their own SaveVideo), then THIS node decodes
+    the files fresh and concatenates them — video frames along the
+    batch axis, audio tracks along time. The film is a graph output,
+    not a harness side-effect.
+
+    ``videos``: comma list of OUTPUT-DIR PREFIXES (the SaveVideo
+    filename_prefixes, e.g. ``h3-film/h3_t4_w1,h3-film/h3_t4_w2``) —
+    each resolves at RUNTIME (post-save) to the newest
+    ``<prefix>_<counter>_.mp4``. No validate-time existence check:
+    the files are written by UPSTREAM nodes of this very prompt.
+
+    ``after``: the MeliteUnload boundary token (REQUIRED) — the
+    ordering wire proving every save completed before any decode
+    starts. Absent it, this node refuses loudly rather than risk
+    stitching a previous run's stale files.
+
+    Loud refusals (never a silently-wrong film): a prefix with no
+    match, mismatched fps, or mismatched sample rates across windows.
+    """
+
+    TITLE = "Melite Concat Videos (file tail)"
+    CATEGORY = "melite/film"
+    RETURN_TYPES = ("IMAGE", "AUDIO", "FLOAT")
+    RETURN_NAMES = ("images", "audio", "fps")
+    FUNCTION = "concat"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "videos": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "tooltip": "Comma list of output-dir SaveVideo prefixes, in film order",
+                }),
+                "after": ("STRING", {
+                    "tooltip": "The MeliteUnload boundary token — proof every save completed",
+                }),
+            },
+        }
+
+    def concat(self, videos, after):
+        if _np is None or _torch is None:
+            raise RuntimeError(
+                "melite-utility-nodes: numpy + torch are required to decode media"
+            )
+        prefixes = [p.strip() for p in str(videos).split(",") if p.strip()]
+        if len(prefixes) == 0:
+            raise RuntimeError(
+                "MeliteConcatVideos: 'videos' is empty — the film tail needs "
+                "at least one saved window prefix"
+            )
+        if not str(after).strip():
+            raise RuntimeError(
+                "MeliteConcatVideos: 'after' is empty — wire MeliteUnload's "
+                "token (the ordering proof that every save completed)"
+            )
+        image_batches = []
+        audio_wavs = []
+        sample_rate = None
+        fps = None
+        for prefix in prefixes:
+            path = _resolve_output_prefix(prefix)
+            frames, this_fps = _decode_video_frames(path)
+            if fps is None:
+                fps = this_fps
+            elif abs(this_fps - fps) > 0.01:
+                raise RuntimeError(
+                    f"MeliteConcatVideos: window {prefix!r} plays at "
+                    f"{this_fps}fps but the film is {fps}fps — every window "
+                    f"must share the clock (never a silently-restamped film)"
+                )
+            audio = _decode_audio_track(path, frames.shape[0] / this_fps)
+            if sample_rate is None:
+                sample_rate = audio["sample_rate"]
+            elif audio["sample_rate"] != sample_rate:
+                raise RuntimeError(
+                    f"MeliteConcatVideos: window {prefix!r} samples at "
+                    f"{audio['sample_rate']}Hz but the film runs "
+                    f"{sample_rate}Hz — every window must share the rate"
+                )
+            image_batches.append(frames)
+            audio_wavs.append(audio["waveform"])
+        # channel broadcast to the widest window (mono → stereo
+        # repeats; never a dropped channel)
+        max_ch = max(w.shape[1] for w in audio_wavs)
+        aligned = []
+        for w in audio_wavs:
+            if w.shape[1] < max_ch:
+                w = w.repeat_interleave(max_ch // w.shape[1], dim=1)
+            aligned.append(w)
+        images = _torch.cat(image_batches, dim=0)
+        waveform = _torch.cat(aligned, dim=2)
+        return (images, {"waveform": waveform, "sample_rate": sample_rate}, fps)
+
+
+# ════════════════════════════════════════════════════════════════════════
 # Registration
 # ════════════════════════════════════════════════════════════════════════
 NODE_CLASS_MAPPINGS = {
@@ -781,6 +1056,8 @@ NODE_CLASS_MAPPINGS = {
     "HYMotionModelDir": HYMotionModelDir,
     "SeeThroughModelDir": SeeThroughModelDir,
     "MotionPreview": MotionPreview,
+    "MeliteUnload": MeliteUnload,
+    "MeliteConcatVideos": MeliteConcatVideos,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -791,4 +1068,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "HYMotionModelDir": "🕺 HY-Motion Model (dropdown)",
     "SeeThroughModelDir": "👕 See-Through Model (dropdown)",
     "MotionPreview": "🏃 Motion Preview",
+    "MeliteUnload": "🎬 Melite Unload (film boundary)",
+    "MeliteConcatVideos": "🎬 Melite Concat Videos (file tail)",
 }

@@ -25,6 +25,18 @@ General-purpose nodes that improve the dev workflow:
                    Renders a stick-figure skeleton at keyframe poses and
                    returns them as an animated preview. Accepts the NPZ
                    path STRING output of KimodoTextToPose or HYMotion nodes.
+
+  MeliteUnload   — the film tail's memory boundary (roadmap §20, the
+                   in-graph amendment): consumes the last window's
+                   SaveVideo passthrough (the ordering wire — downstream
+                   file-loaders wait for the saves) and flushes the CUDA
+                   allocator WITHOUT dropping model weights (the next
+                   run pays no reload; unload_models=True for a full wipe).
+
+  MeliteConcatVideos — the film-assemble loader: decodes saved window
+                   FILES back into the graph (output-dir prefixes →
+                   IMAGE + AUDIO + fps), so the film is a pure graph
+                   output assembled strictly after every save completed.
 """
 from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 
