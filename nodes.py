@@ -814,14 +814,24 @@ class MeliteUnload:
     TWO jobs, one wire:
 
     1. ORDERING (the structural half): consumes a VIDEO passthrough
-       (e.g. the last window's SaveVideo output) and returns a token
-       that downstream file-loaders wire as their ``after`` input.
+       (a window's SaveVideo output) and returns a token that
+       downstream file-loaders wire as their ``after`` input.
        ComfyUI's dependency order then guarantees every loader runs
        only AFTER the saves completed — without this, a loader could
        glob the output directory before the save writes and silently
        stitch the PREVIOUS run's files (a wrong film that looks
        fine — the worst failure this pack guards against). Being the
        passthrough's last consumer also makes that tensor die here.
+
+       THE CHAIN (2026-09-23, the cut-film fix): one boundary alone
+       orders only ITS OWN save — cut-transition windows chain
+       nothing, so every other window's save stayed an unordered
+       island the loader could beat (receipts: the 576×768 stale
+       stitch and the loud no-match on h3_t4_w2, both 2026-09-23).
+       The optional ``after`` input wires a PRIOR boundary's token:
+       the card emits one boundary per window save, chaining them,
+       so the chain's final token transitively depends on EVERY
+       save. The input is pure ordering — accepted, never read.
 
     2. MEMORY POLICY (the operator's reload law, 2026-09-22): the
        DEFAULT releases only the CUDA allocator's cached blocks
@@ -849,9 +859,21 @@ class MeliteUnload:
                 "video": ("VIDEO",),
                 "unload_models": ("BOOLEAN", {"default": False}),
             },
+            "optional": {
+                "after": ("STRING", {
+                    "tooltip": (
+                        "A PRIOR boundary's token — chains the boundaries "
+                        "so the final token provably waits for EVERY "
+                        "window save (pure ordering; never read)"
+                    ),
+                }),
+            },
         }
 
-    def unload(self, video, unload_models=False):
+    def unload(self, video, unload_models=False, after=None):
+        # ``after`` is the chain's ordering wire only — accepted so
+        # ComfyUI schedules this node behind the prior boundary; its
+        # value is never read (the token is constant by design).
         import comfy.model_management as mm
 
         if unload_models:
