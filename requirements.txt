@@ -1,0 +1,5 @@
+# melite-utility-nodes — deps BEYOND the engine base env.
+# av is a guarded import (video inspection degrades without it);
+# matplotlib drives the plot utilities.
+matplotlib
+av
