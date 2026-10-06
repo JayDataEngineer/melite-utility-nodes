@@ -1067,6 +1067,193 @@ class MeliteConcatVideos:
         return (images, {"waveform": waveform, "sample_rate": sample_rate}, fps)
 
 
+class MeliteFrameSheet:
+    """One saved video → a contact-sheet IMAGE (evenly spaced frames).
+
+    The melite_view film arm's decode seat (roadmap §"host binaries"):
+    the tool must not shell to ffmpeg, and the harness must not become
+    a codec vendor — so the ENGINE decodes (PyAV, the same seat
+    MeliteConcatVideos rides) and composes the sheet as a graph output
+    the tool reads back through /view. Two frames per row, rows
+    stacked — the sheet shape the observe arm always attached.
+
+    ``video``: path to a saved video — absolute, or relative to the
+    engine's output directory. ``stamps``: frame count (1..12).
+    ``width``: per-frame width in px (aspect kept). Loud refusals
+    (never a silently-wrong sheet): a missing file, an undecodable
+    container, an empty frame stream.
+    """
+
+    TITLE = "Melite Frame Sheet (view arm)"
+    CATEGORY = "melite/view"
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("sheet",)
+    FUNCTION = "sheet"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "tooltip": "Path to a saved video (absolute, or output-dir relative)",
+                }),
+                "stamps": ("INT", {
+                    "default": 6, "min": 1, "max": 12,
+                    "tooltip": "How many evenly spaced frames tile the sheet",
+                }),
+                "width": ("INT", {
+                    "default": 320, "min": 64, "max": 1920,
+                    "tooltip": "Per-frame width in px (aspect kept)",
+                }),
+            },
+        }
+
+    def sheet(self, video, stamps, width):
+        if _torch is None or _np is None:
+            raise RuntimeError(
+                "melite-utility-nodes: torch + numpy are required to build a frame sheet"
+            )
+        path = _resolve_media_path(str(video), "MeliteFrameSheet")
+        try:
+            frames, _fps = _decode_video_frames(path)
+        except IndexError:
+            # PyAV's own voice for an audio-only container is a bare
+            # 'tuple index out of range' — a view arm names itself
+            raise RuntimeError(
+                f"MeliteFrameSheet: no video stream in {path} — the "
+                "sheet arm decodes films only"
+            ) from None
+        k = max(1, min(int(stamps), frames.shape[0]))
+        picks = [round(i * (frames.shape[0] - 1) / (k - 1)) for i in range(k)] if k > 1 else [0]
+        picked = frames[picks]  # [k,H,W,C]
+        # per-frame width normalize (aspect kept) — the scale=320:-1 law
+        resized = []
+        for f in picked:
+            new_h = max(1, round(f.shape[0] * (int(width) / f.shape[1])))
+            r = _torch.nn.functional.interpolate(
+                f.permute(2, 0, 1).unsqueeze(0), size=(new_h, int(width)),
+                mode="bilinear", align_corners=False,
+            )[0].permute(1, 2, 0)
+            resized.append(r)
+        # pad every frame to the tallest so rows align, two per row
+        tall = max(r.shape[0] for r in resized)
+        padded = [
+            _torch.nn.functional.pad(r, (0, 0, 0, tall - r.shape[0]))
+            for r in resized
+        ]
+        rows = [
+            _torch.cat(padded[i:i + 2], dim=1)
+            for i in range(0, len(padded), 2)
+        ]
+        # a lone odd tail frame pads to the row's own width (a sheet
+        # row is never half-empty black)
+        last = rows[-1]
+        if last.shape[1] != rows[0].shape[1]:
+            rows[-1] = _torch.nn.functional.pad(
+                last, (0, rows[0].shape[1] - last.shape[1])
+            )
+        sheet = _torch.cat(rows, dim=0).unsqueeze(0)
+        return (sheet,)
+
+
+class MeliteWaveform:
+    """One saved audio file → a waveform IMAGE (min/max envelope).
+
+    The melite_view audio arm's decode seat: PyAV decodes the file
+    (never a harness-side ffmpeg), the envelope renders as filled
+    columns — the showwavespic shape the observe arm always attached.
+
+    ``audio``: path to a saved audio file — absolute, or relative to
+    the engine's output directory. Loud refusals: a missing file, an
+    undecodable container, an empty sample stream.
+    """
+
+    TITLE = "Melite Waveform (view arm)"
+    CATEGORY = "melite/view"
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("waveform",)
+    FUNCTION = "waveform"
+
+    # showwavespic's own palette (the observe arm's sheet was always
+    # #9db4ff on black — the shape is pinned, not redrawn)
+    _RGB = (0x9D / 255.0, 0xB4 / 255.0, 0xFF / 255.0)
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "audio": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "tooltip": "Path to a saved audio file (absolute, or output-dir relative)",
+                }),
+                "width": ("INT", {
+                    "default": 640, "min": 64, "max": 3840,
+                    "tooltip": "Sheet width in px",
+                }),
+                "height": ("INT", {
+                    "default": 240, "min": 64, "max": 2160,
+                    "tooltip": "Sheet height in px",
+                }),
+            },
+        }
+
+    def waveform(self, audio, width, height):
+        if _av is None or _torch is None:
+            raise RuntimeError(
+                "melite-utility-nodes: PyAV (av) + torch are required to render a waveform"
+            )
+        path = _resolve_media_path(str(audio), "MeliteWaveform")
+        with _av.open(path) as container:
+            if not container.streams.audio:
+                raise ValueError(f"No audio stream in {path}")
+            stream = container.streams.audio[0]
+            chunks = []
+            for frame in container.decode(streams=stream.index):
+                buf = _torch.from_numpy(frame.to_ndarray()).float()
+                if buf.dim() > 1:
+                    buf = buf.mean(dim=0)
+                chunks.append(buf)
+            if not chunks:
+                raise ValueError(f"No audio frames decoded from {path}")
+            mono = _torch.cat(chunks, dim=0)
+        w, h = int(width), int(height)
+        # min/max envelope per column (the showwavespic law: both
+        # halves of every column)
+        seg_len = max(1, int(mono.shape[0] // w))
+        canvas = _torch.zeros(3, h, w)
+        for c in range(w):
+            s = mono[c * seg_len:(c + 1) * seg_len]
+            if s.numel() == 0:
+                continue
+            top = round((1.0 - min(1.0, float(s.max()))) * (h - 1) / 2)
+            bot = round((1.0 + max(-1.0, float(s.min()))) * (h - 1) / 2)
+            if bot <= top:
+                bot = min(h - 1, top + 1)
+            for ch, v in enumerate(self._RGB):
+                canvas[ch, top:bot + 1, c] = v
+        return (canvas.permute(1, 2, 0).unsqueeze(0),)
+
+
+def _resolve_media_path(raw: str, who: str) -> str:
+    """A media path for the view nodes: absolute as-is, else resolved
+    against the engine's output directory (where the estate's runs
+    land). Loud refusal when the file is absent — a view arm never
+    renders a blank sheet for a missing film."""
+    p = str(raw).strip()
+    if not p:
+        raise RuntimeError(f"{who}: the media path is empty")
+    if not os.path.isabs(p):
+        import folder_paths
+
+        p = os.path.join(folder_paths.get_output_directory(), p)
+    if not os.path.isfile(p):
+        raise RuntimeError(f"{who}: no media file at {p!r}")
+    return p
+
+
 # ════════════════════════════════════════════════════════════════════════
 # Registration
 # ════════════════════════════════════════════════════════════════════════
@@ -1080,6 +1267,8 @@ NODE_CLASS_MAPPINGS = {
     "MotionPreview": MotionPreview,
     "MeliteUnload": MeliteUnload,
     "MeliteConcatVideos": MeliteConcatVideos,
+    "MeliteFrameSheet": MeliteFrameSheet,
+    "MeliteWaveform": MeliteWaveform,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1092,4 +1281,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MotionPreview": "🏃 Motion Preview",
     "MeliteUnload": "🎬 Melite Unload (film boundary)",
     "MeliteConcatVideos": "🎬 Melite Concat Videos (file tail)",
+    "MeliteFrameSheet": "🎞️ Melite Frame Sheet (view arm)",
+    "MeliteWaveform": "〰️ Melite Waveform (view arm)",
 }
