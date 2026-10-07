@@ -8,6 +8,8 @@ description = "Melite Utility (model dirs, GLB preview, plots) — a Melite firs
 # git-url door, [project].dependencies is what the Comfy registry
 # action installs at publish — the estate's pack-parity wall pins
 # the two doors read the same set (registry door, 2026-10-18).
+license = {file = "LICENSE"}
+repository = "https://github.com/JayDataEngineer/melite-utility-nodes"
 dependencies = [
     "matplotlib",
     "av",
