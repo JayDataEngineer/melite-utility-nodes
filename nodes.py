@@ -915,6 +915,51 @@ def _resolve_output_prefix(prefix: str) -> str:
     return max(matches, key=counter_of)
 
 
+def _resolve_append_path(value: str) -> str:
+    """The append member's EXACT saved file (the compose face of the
+    film tail, 2026-11-12 multi-window unification): an absolute
+    path, or output-dir relative. Unlike a prefix member this is a
+    wired runtime path (e.g. MiniMaxH3ChainAssemble's video_path
+    output) — the graph's own data dependency proves the file was
+    written before this node runs, so no counter glob applies. Loud
+    refusal when the exact file is absent.
+    """
+    import folder_paths
+
+    text = str(value or "").strip()
+    if not text:
+        raise RuntimeError(
+            "MeliteConcatVideos: 'append' is empty — wire the exact "
+            "saved-file path (e.g. ChainAssemble's video_path) or omit it"
+        )
+    candidate = text if os.path.isabs(text) else os.path.join(
+        folder_paths.get_output_directory(), text)
+    if not os.path.isfile(candidate):
+        raise RuntimeError(
+            f"MeliteConcatVideos: append member {text!r} resolves to no "
+            f"file ({candidate}) — an exact path must exist at decode "
+            f"time; its producing node must be an upstream dependency"
+        )
+    return candidate
+
+
+def _concat_members(videos: str, append: str) -> list[tuple[str, str]]:
+    """The concat's member list: prefix members in listed order, then
+    the exact append member LAST (film order). One home for the
+    member grammar so the node body and the unit tests judge the
+    same law.
+    """
+    members = [
+        (prefix, _resolve_output_prefix(prefix))
+        for prefix in (p.strip() for p in str(videos).split(","))
+        if prefix
+    ]
+    text = str(append or "").strip()
+    if text:
+        members.append((text, _resolve_append_path(text)))
+    return members
+
+
 def _decode_video_frames(path: str):
     """One file → (frames [N,H,W,C] float 0..1 torch, fps float)."""
     if _av is None or _torch is None:
@@ -987,8 +1032,21 @@ class MeliteConcatVideos:
     starts. Absent it, this node refuses loudly rather than risk
     stitching a previous run's stale files.
 
+    ``append`` (optional, the compose face — 2026-11-12 multi-window
+    unification): an EXACT saved-file path appended as the LAST
+    member after the prefix list. This is how an in-chain assembly
+    (MiniMaxH3ChainAssemble's video_path output, wired) joins a
+    by-file head: the wired string is a runtime path whose producing
+    node is an upstream dependency of this very input, so the graph
+    itself proves the write completed — no boundary token and no
+    counter glob apply. Absolute, or output-dir relative; loud
+    refusal when the exact file is absent. At least one prefix
+    member still rides ``videos`` (a pure append is a different
+    concern).
+
     Loud refusals (never a silently-wrong film): a prefix with no
-    match, mismatched fps, or mismatched sample rates across windows.
+    match, a missing append file, mismatched fps, or mismatched
+    sample rates across windows.
     """
 
     TITLE = "Melite Concat Videos (file tail)"
@@ -1009,10 +1067,17 @@ class MeliteConcatVideos:
                 "after": ("STRING", {
                     "tooltip": "The MeliteUnload boundary token — proof every save completed",
                 }),
+                "append": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "tooltip": "Optional EXACT saved-file path appended as the last member "
+                               "(e.g. ChainAssemble's wired video_path) — the in-chain "
+                               "assembly compose face",
+                }),
             },
         }
 
-    def concat(self, videos, after):
+    def concat(self, videos, after, append=""):
         if _np is None or _torch is None:
             raise RuntimeError(
                 "melite-utility-nodes: numpy + torch are required to decode media"
@@ -1028,19 +1093,19 @@ class MeliteConcatVideos:
                 "MeliteConcatVideos: 'after' is empty — wire MeliteUnload's "
                 "token (the ordering proof that every save completed)"
             )
+        members = _concat_members(videos, str(append or ""))
         image_batches = []
         audio_wavs = []
         sample_rate = None
         fps = None
-        for prefix in prefixes:
-            path = _resolve_output_prefix(prefix)
+        for label, path in members:
             frames, this_fps = _decode_video_frames(path)
             if fps is None:
                 fps = this_fps
             elif abs(this_fps - fps) > 0.01:
                 raise RuntimeError(
-                    f"MeliteConcatVideos: window {prefix!r} plays at "
-                    f"{this_fps}fps but the film is {fps}fps — every window "
+                    f"MeliteConcatVideos: member {label!r} plays at "
+                    f"{this_fps}fps but the film is {fps}fps — every member "
                     f"must share the clock (never a silently-restamped film)"
                 )
             audio = _decode_audio_track(path, frames.shape[0] / this_fps)
@@ -1048,9 +1113,9 @@ class MeliteConcatVideos:
                 sample_rate = audio["sample_rate"]
             elif audio["sample_rate"] != sample_rate:
                 raise RuntimeError(
-                    f"MeliteConcatVideos: window {prefix!r} samples at "
+                    f"MeliteConcatVideos: member {label!r} samples at "
                     f"{audio['sample_rate']}Hz but the film runs "
-                    f"{sample_rate}Hz — every window must share the rate"
+                    f"{sample_rate}Hz — every member must share the rate"
                 )
             image_batches.append(frames)
             audio_wavs.append(audio["waveform"])
