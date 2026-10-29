@@ -100,6 +100,15 @@ class ConcatAppendUnitTest(unittest.TestCase):
         self.assertEqual(len(members), 1)
         self.assertEqual(members[0][1], self.prefix_file)
 
+    def test_append_is_an_optional_input(self):
+        # the compose face's seat: append rides OPTIONAL (omitted by
+        # every plain film join; the required seat would demand the
+        # field even where no assembly exists)
+        inputs = self.nodes.MeliteConcatVideos.INPUT_TYPES()
+        self.assertNotIn("append", inputs["required"])
+        self.assertIn("append", inputs["optional"])
+        self.assertEqual(inputs["optional"]["append"][1]["default"], "")
+
     def test_prefix_member_still_globbed_by_counter(self):
         newer = os.path.join(self.out, "run_x0_00002_.mp4")
         with open(newer, "wb") as handle:

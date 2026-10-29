@@ -1067,6 +1067,8 @@ class MeliteConcatVideos:
                 "after": ("STRING", {
                     "tooltip": "The MeliteUnload boundary token — proof every save completed",
                 }),
+            },
+            "optional": {
                 "append": ("STRING", {
                     "default": "",
                     "multiline": False,
