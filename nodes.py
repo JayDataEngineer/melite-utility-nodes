@@ -1322,6 +1322,123 @@ def _resolve_media_path(raw: str, who: str) -> str:
 
 
 # ════════════════════════════════════════════════════════════════════════
+# H3 chain store listings — the estate's deferred-upscale discovery seat.
+# The upstream MiniMaxH3-Context-Loop pack checkpoints each chain scene at
+# ``<output>/h3_chains/<run>/checkpoints/clip_%04d.<rev32>.json`` and its
+# CheckpointManager node wants a ``selection_json`` the browser UI authors.
+# The estate's whole-film 2x upscale pass needs that selection headlessly:
+# name a run, read each scene's saved revisions, default to the newest.
+# Pure layout reads over the pack's documented store — never an import of
+# its internals, never a mutation.
+# ════════════════════════════════════════════════════════════════════════
+
+_H3_CHAINS_DIRNAME = "h3_chains"
+_CHECKPOINT_RE = _re.compile(r"^clip_(\d{4})\.([0-9a-f]{32})\.json$")
+_RUN_NAME_RE = _re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _h3_chains_root() -> str:
+    import folder_paths
+
+    return os.path.join(folder_paths.get_output_directory(),
+                        _H3_CHAINS_DIRNAME)
+
+
+def _h3_chain_run_names() -> list[str]:
+    root = _h3_chains_root()
+    try:
+        entries = sorted(os.listdir(root))
+    except FileNotFoundError:
+        return []
+    return [n for n in entries
+            if _RUN_NAME_RE.match(n) and os.path.isdir(os.path.join(root, n))]
+
+
+def _h3_chain_scene_revisions(run_name: str) -> dict[int, list[str]]:
+    """Scene → saved revision ids, ordered by checkpoint mtime."""
+    checkpoints = os.path.join(_h3_chains_root(), run_name, "checkpoints")
+    try:
+        names = sorted(os.listdir(checkpoints))
+    except FileNotFoundError:
+        return {}
+    staged: dict[int, list[tuple[float, str]]] = {}
+    for name in names:
+        m = _CHECKPOINT_RE.match(name)
+        if m is None:
+            continue
+        try:
+            mtime = os.path.getmtime(os.path.join(checkpoints, name))
+        except OSError:
+            mtime = 0.0
+        staged.setdefault(int(m.group(1)), []).append((mtime, m.group(2)))
+    return {scene: [rev for _, rev in sorted(rows)]
+            for scene, rows in staged.items()}
+
+
+def _h3_chain_runs_command(request):
+    runs = []
+    root = _h3_chains_root()
+    for name in _h3_chain_run_names():
+        scenes = _h3_chain_scene_revisions(name)
+        if not scenes:
+            continue
+        runs.append({
+            "run_name": name,
+            "scenes": len(scenes),
+            "updated": os.path.getmtime(
+                os.path.join(root, name, "checkpoints")),
+        })
+    return _json_response({"runs": runs})
+
+
+def _h3_chain_checkpoints_command(request):
+    run_name = str(request.query.get("run", "")).strip()
+    if not _RUN_NAME_RE.match(run_name):
+        return _json_response({
+            "error": "name a chain run (?run=<run_name>)",
+            "runs": _h3_chain_run_names(),
+        }, status=400)
+    scenes = _h3_chain_scene_revisions(run_name)
+    if not scenes:
+        return _json_response({
+            "error": f"chain run '{run_name}' holds no scene checkpoints",
+            "runs": [n for n in _h3_chain_run_names()
+                     if _h3_chain_scene_revisions(n)],
+        }, status=404)
+    return _json_response({
+        "run_name": run_name,
+        "scenes": [
+            {"scene": scene, "revisions": revisions,
+             "latest": revisions[-1]}
+            for scene, revisions in sorted(scenes.items())
+        ],
+    })
+
+
+def _json_response(payload, status: int = 200):
+    from aiohttp import web
+
+    return web.json_response(payload, status=status)
+
+
+try:
+    from aiohttp import web as _web
+except ImportError:
+    _web = None
+try:
+    from server import PromptServer as _PromptServer
+except ImportError:
+    _PromptServer = None
+
+if (_web is not None and _PromptServer is not None and
+        getattr(_PromptServer, "instance", None) is not None):
+    _PromptServer.instance.routes.get("/melite/h3-chain-runs")(
+        _h3_chain_runs_command)
+    _PromptServer.instance.routes.get("/melite/h3-chain-checkpoints")(
+        _h3_chain_checkpoints_command)
+
+
+# ════════════════════════════════════════════════════════════════════════
 # Registration
 # ════════════════════════════════════════════════════════════════════════
 NODE_CLASS_MAPPINGS = {
